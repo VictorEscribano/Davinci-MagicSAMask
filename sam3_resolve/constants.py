@@ -94,7 +94,7 @@ SAM3_LARGE_SHA256 = ""   # populated at first successful download; validated on 
 SAM3_BASE_SHA256 = ""
 
 SAM3_LARGE_SIZE_BYTES = 898_100_000     # ~898 MB (sam2.1_hiera_large.pt)
-SAM3_BASE_SIZE_BYTES = 378_000_000      # ~360 MB
+SAM3_BASE_SIZE_BYTES = 323_700_000      # ~323.6 MB (sam2.1_hiera_base_plus.pt)
 
 VRAM_THRESHOLD_LARGE_GB = 7.0           # switch to Base below this (8 GB cards report ~7.7 GB free)
 
