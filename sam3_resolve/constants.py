@@ -110,11 +110,16 @@ BASE_DEPS = [
     "tqdm",
 ]
 
-TORCH_DEPS_CUDA = [
+TORCH_PACKAGES = [
     "torch",
     "torchvision",
     "torchaudio",
 ]
+
+# Keep the old name as an alias so existing imports don't break
+TORCH_DEPS_CUDA = TORCH_PACKAGES
+
+TORCH_INDEX_CPU = "https://download.pytorch.org/whl/cpu"
 
 # SAM3 / SAM2 from GitHub
 SAM3_GITHUB_URL = "git+https://github.com/facebookresearch/sam2.git"

@@ -5,7 +5,8 @@
   "venv_path": "",
   "models_dir": "",
   "active_model": "sam3_large",
-  "device": "auto",
+  "device": "cpu",
+  "resolve_api_path": "",
   "gpu_profile": {
     "backend": "",
     "device_name": "",
@@ -30,5 +31,25 @@
   "checksums": {
     "sam3_large": "",
     "sam3_base": ""
+  },
+  "model_name": "base",
+  "use_fp16": true,
+  "proxy_crf": 18,
+  "export_dir": "",
+  "export_workers": 4,
+  "keybindings": {
+    "Add positive point": "",
+    "Add negative point": "",
+    "Undo last prompt": "Ctrl+Z",
+    "Redo": "Ctrl+Shift+Z",
+    "Clear all prompts": "Ctrl+Shift+C",
+    "Start propagation": "Ctrl+Return",
+    "Switch to Points": "P",
+    "Switch to Box": "B",
+    "Switch to Mask": "M",
+    "Toggle fullscreen": "F",
+    "Zoom in": "=",
+    "Zoom out": "-",
+    "Reset zoom": "0"
   }
 }

@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+import numpy as np
+
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QColor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -495,12 +497,15 @@ class TransportBar(QWidget):
             btn.setFixedSize(QSize(28, 28))
             return btn
 
-        self._btn_first  = _tb("|◀", "First frame")
-        self._btn_prev   = _tb("◀",  "Previous frame")
+        self._btn_first  = _tb("⏮",  "First frame")
+        self._btn_prev   = _tb("⏪",  "Previous frame")
         self._btn_play   = _tb("▶",  "Play / Pause (Space)")
         self._btn_play.setCheckable(True)
-        self._btn_next   = _tb("▶",  "Next frame")
-        self._btn_last   = _tb("▶|", "Last frame")
+        self._btn_play.toggled.connect(
+            lambda on: self._btn_play.setText("⏸" if on else "▶")
+        )
+        self._btn_next   = _tb("⏩",  "Next frame")
+        self._btn_last   = _tb("⏭",  "Last frame")
 
         self._btn_first.clicked.connect(lambda: self.frame_changed.emit(0))
         self._btn_prev.clicked.connect(self._step_back)
@@ -824,8 +829,13 @@ class RightPanel(QWidget):
         layout.addWidget(self._detection_card)
         layout.addStretch()
 
+        self._scroll = scroll
         scroll.setWidget(content)
         outer.addWidget(scroll)
+
+    def scroll_to_text_input(self) -> None:
+        self._scroll.ensureWidgetVisible(self.text_input)
+        self.text_input.setFocus()
 
     def update_object_count(self, n: int) -> None:
         self._objects_title.setText(f"OBJECTS ({n} / {MAX_OBJECTS})")
@@ -978,6 +988,10 @@ class MainWindow(QMainWindow):
 
         self._clip = clip
         self._current_frame = 0
+        self._frame_reader = None   # set via attach_frame_reader()
+        self._playback_fps = 25.0
+        self._playback_speed = 1.0
+        self._play_timer: Optional[QTimer] = None
         self._build_ui()
         self._wire_signals()
 
@@ -1049,6 +1063,10 @@ class MainWindow(QMainWindow):
         self.bottom_panel = BottomPanel()
         root.addWidget(self.bottom_panel)
 
+        # ── Settings panel (overlay, slides in from right) ──
+        from sam3_resolve.ui.settings_panel import SettingsPanel
+        self.settings_panel = SettingsPanel(parent=central)
+
     def _wire_signals(self) -> None:
         self.header.settings_requested.connect(self._toggle_settings)
         self.left_panel.prompt_mode_changed.connect(self._on_prompt_mode_changed)
@@ -1060,7 +1078,13 @@ class MainWindow(QMainWindow):
         self.action_bar.modify_requested.connect(self._on_modify)
         self.action_bar.cancel_requested.connect(self._on_cancel)
         self.transport.frame_changed.connect(self._on_frame_changed)
+        self.transport.play_toggled.connect(self._on_play_toggled)
+        self.transport.speed_changed.connect(self._on_speed_changed)
         self.right_panel.add_object_requested.connect(self._on_add_object)
+
+        # Playback timer
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_tick)
         # Canvas ↔ UI
         self.canvas.prompts_changed.connect(self._on_prompts_changed)
         self.canvas.inference_requested.connect(self._on_inference_requested)
@@ -1070,6 +1094,7 @@ class MainWindow(QMainWindow):
 
     def _apply_clip(self, clip: ClipInfo) -> None:
         self._clip = clip
+        self._playback_fps = clip.fps
         self.header.update_clip_info(clip)
         self.left_panel.update_clip_info(clip)
         self.transport.set_total_frames(clip.duration_frames)
@@ -1079,13 +1104,39 @@ class MainWindow(QMainWindow):
     # ── Signal handlers ────────────────────────────────────────────────────
 
     def _on_prompt_mode_changed(self, mode: str) -> None:
+        self.canvas.set_mode(mode)
         self.context_bar.set_mode(mode)
         self.toolbar.set_active_tool(mode if mode in ("pan", "point", "box") else "point")
         self.bottom_panel.append_log("INFO", f"Prompt mode → {mode}")
+        if mode == "text":
+            self.right_panel.scroll_to_text_input()
 
     def _on_frame_changed(self, idx: int) -> None:
         self._current_frame = idx
         self.transport.set_frame(idx)
+        # If a frame reader is attached (debug / real mode), load the frame
+        if self._frame_reader is not None:
+            try:
+                frame = self._frame_reader(idx)
+                if frame is not None:
+                    total = self._clip.duration_frames if self._clip else 1
+                    self.canvas.set_frame(frame, idx, total)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Frame read error at idx %d: %s", idx, exc)
+
+    def attach_frame_reader(
+        self, reader: "Callable[[int], Optional[np.ndarray]]"
+    ) -> None:
+        """
+        Attach a callable that returns a BGR numpy frame for a given index.
+
+        Called by plugin_main (both Resolve and debug modes) to connect real
+        video data to the canvas.  The reader is called whenever the transport
+        scrubber moves.
+        """
+        self._frame_reader = reader
+        # Load frame 0 immediately so the canvas is not blank on startup
+        self._on_frame_changed(0)
 
     def _on_clear_all(self) -> None:
         self.bottom_panel.append_log("INFO", "All prompts cleared")
@@ -1147,10 +1198,54 @@ class MainWindow(QMainWindow):
         self.canvas.set_inference_running(False)
         self.toolbar.set_zoom(self.canvas.zoom_percent)
 
+    def _on_play_toggled(self, playing: bool) -> None:
+        if playing:
+            interval = max(16, int(1000 / (self._playback_fps * self._playback_speed)))
+            self._play_timer.start(interval)
+        else:
+            self._play_timer.stop()
+
+    def _on_speed_changed(self, speed: float) -> None:
+        self._playback_speed = speed
+        if self._play_timer and self._play_timer.isActive():
+            interval = max(16, int(1000 / (self._playback_fps * self._playback_speed)))
+            self._play_timer.setInterval(interval)
+
+    def _on_play_tick(self) -> None:
+        total = self._clip.duration_frames if self._clip else 0
+        next_idx = self._current_frame + 1
+        if next_idx >= total:
+            self._play_timer.stop()
+            self.transport._btn_play.setChecked(False)
+            return
+        self._on_frame_changed(next_idx)
+
     def _toggle_settings(self) -> None:
-        self.bottom_panel.append_log("INFO", "Settings panel toggled")
+        if self.settings_panel._visible:
+            self.settings_panel.hide_panel()
+        else:
+            self.settings_panel.show_panel()
 
     # ── GPU status (called after gpu_utils.detect_gpu) ────────────────────
 
     def set_gpu_info_label(self, label: str, ready: bool = True) -> None:
         self.header.update_gpu_status(label, ready)
+
+# def main():
+#     import sys
+#     app = QApplication(sys.argv)
+
+#     from sam3_resolve.core.resolve_bridge import MockResolveBridge
+
+#     bridge = MockResolveBridge()
+#     clips = bridge.get_selected_clips()
+#     clip = clips[0] if clips else None
+
+#     window = MainWindow(clip=clip)
+#     window.show()
+
+#     sys.exit(app.exec())
+
+
+# if __name__ == "__main__":
+#     main()

@@ -623,6 +623,11 @@ class MockSAM3Runner(SAM3RunnerBase):
         }
         self.propagation_calls.append(call_record)
 
+        if stop_event and stop_event.is_set():
+            result.cancelled = True
+            call_record["cancelled"] = True
+            return result
+
         for frame_idx, frame in frames:
             if stop_event and stop_event.is_set():
                 result.cancelled = True

@@ -62,6 +62,7 @@ from sam3_resolve.constants import (  # noqa: E402
     SAM3_LARGE_URL,
     SAM3_MIN_PYTHON,
     TORCH_DEPS_CUDA,
+    TORCH_INDEX_CPU,
     VENV_DIR,
     VRAM_THRESHOLD_LARGE_GB,
 )
@@ -257,17 +258,21 @@ def install_deps(gpu_info: dict) -> None:
     # Upgrade pip first
     _pip_run([pip, "install", "--upgrade", "pip", "setuptools", "wheel"])
 
-    # Torch — pick the right index URL for the detected CUDA version
-    if gpu_info["backend"] == "cuda":
+    # Torch — pick wheels matching the detected backend
+    backend = gpu_info["backend"]
+    if backend == "cuda":
         cuda_ver = gpu_info.get("cuda_version", "")
         index_url = _torch_index_url(cuda_ver)
-        _ok(f"Installing torch with CUDA wheels from {index_url}")
-        _pip_run(
-            [pip, "install"] + TORCH_DEPS_CUDA + ["--index-url", index_url]
-        )
-    else:
-        _ok("Installing CPU-only torch")
+        _ok(f"Installing torch (CUDA wheels) from {index_url}")
+        _pip_run([pip, "install"] + TORCH_DEPS_CUDA + ["--index-url", index_url])
+    elif backend == "mps":
+        # Apple Silicon: standard PyPI wheels already include MPS support
+        _ok("Installing torch (standard wheels, MPS support included)")
         _pip_run([pip, "install"] + TORCH_DEPS_CUDA)
+    else:
+        # CPU-only: use the dedicated CPU index to avoid downloading CUDA wheels
+        _ok(f"Installing torch (CPU-only wheels) from {TORCH_INDEX_CPU}")
+        _pip_run([pip, "install"] + TORCH_DEPS_CUDA + ["--index-url", TORCH_INDEX_CPU])
 
     # SAM3 from GitHub
     _ok("Installing SAM3 from GitHub …")

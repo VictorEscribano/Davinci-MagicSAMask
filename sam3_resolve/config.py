@@ -57,6 +57,9 @@ class Config:
     def __setitem__(self, key: str, value: Any) -> None:
         self._data[key] = value
 
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = value
+
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
 

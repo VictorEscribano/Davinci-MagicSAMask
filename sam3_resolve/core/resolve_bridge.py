@@ -182,40 +182,116 @@ class ProxyRequiredError(RuntimeError):
 
 # ── Real implementation ────────────────────────────────────────────────────
 
-def _inject_resolve_api_path() -> None:
+def _candidate_resolve_api_paths() -> list[Path]:
     """
-    Prepend the Resolve scripting module path to sys.path.
+    Return all candidate directories for the Resolve scripting module,
+    ordered from most-authoritative to least.
 
-    Tries all known install locations for the current OS.
+    Priority:
+      1. RESOLVE_INSTALL_DIR env var — set by Resolve itself when launching
+         external scripts; guaranteed correct when running inside Resolve.
+      2. resolve_api_path in config.json — manually configured by the user.
+      3. Standard install locations per OS.
+      4. Glob search under common parent directories (non-standard installs).
     """
-    from sam3_resolve.constants import RESOLVE_API_SEARCH_PATHS
-
-    search_roots: list[Path] = []
+    import os
+    candidates: list[Path] = []
     system = platform.system()
 
-    if system == "Linux":
-        search_roots = [
-            Path("/opt/resolve/Developer/Scripting/Modules"),
-            Path("/opt/resolve/libs/Fusion"),
-        ]
-    elif system == "Darwin":
-        search_roots = [
-            Path(
-                "/Applications/DaVinci Resolve/DaVinci Resolve.app"
-                "/Contents/Libraries/Fusion/fusionscript.so"
-            ).parent,
-        ]
-    elif system == "Windows":
-        search_roots = [
-            Path(
-                r"C:\Program Files\Blackmagic Design\DaVinci Resolve"
-            ),
+    # 1. Env var that Resolve sets in its own scripting environment
+    env_dir = os.environ.get("RESOLVE_INSTALL_DIR", "")
+    if env_dir:
+        p = Path(env_dir)
+        candidates += [
+            p / "Developer" / "Scripting" / "Modules",
+            p / "libs" / "Fusion",
+            p,
         ]
 
-    for root in search_roots:
-        if root.exists() and str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-            logger.debug("Added Resolve API path: %s", root)
+    # 2. User-configured path saved after a previous successful connection
+    try:
+        from sam3_resolve.config import Config
+        stored = Config.instance().get("resolve_api_path", "")
+        if stored:
+            candidates.append(Path(stored))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. Standard install paths per OS
+    if system == "Linux":
+        candidates += [
+            Path("/opt/resolve/Developer/Scripting/Modules"),
+            Path("/opt/resolve/libs/Fusion"),
+            Path("/usr/local/resolve/Developer/Scripting/Modules"),
+            Path(Path.home() / "resolve" / "Developer" / "Scripting" / "Modules"),
+        ]
+    elif system == "Darwin":
+        app_base = Path("/Applications/DaVinci Resolve")
+        # Resolve can also be installed in /Applications/DaVinci Resolve Studio
+        for app_name in ("DaVinci Resolve", "DaVinci Resolve Studio"):
+            bundle = app_base.parent / app_name / f"{app_name}.app"
+            candidates += [
+                bundle / "Contents" / "Libraries" / "Fusion",
+                bundle / "Contents" / "MacOS",
+            ]
+    elif system == "Windows":
+        candidates += [
+            Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve"),
+            Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve Studio"),
+        ]
+
+    # 4. Glob fallback — search common parent dirs for fusionscript.so/.dll
+    glob_parents: list[Path] = []
+    if system == "Linux":
+        glob_parents = [Path("/opt"), Path("/usr/local"), Path.home()]
+    elif system == "Darwin":
+        glob_parents = [Path("/Applications")]
+    elif system == "Windows":
+        glob_parents = [Path(r"C:\Program Files\Blackmagic Design")]
+
+    lib_name = "fusionscript.so" if system != "Windows" else "fusionscript.dll"
+    for parent in glob_parents:
+        if not parent.exists():
+            continue
+        try:
+            for found in parent.glob(f"**/{lib_name}"):
+                candidates.append(found.parent)
+        except (PermissionError, OSError):
+            pass
+
+    return candidates
+
+
+def _inject_resolve_api_path() -> None:
+    """
+    Prepend the Resolve scripting module directory to sys.path.
+
+    Searches in priority order: RESOLVE_INSTALL_DIR env var → config.json
+    stored path → standard OS paths → glob fallback.  Saves the found path
+    back to config.json so future launches skip the glob.
+    """
+    for candidate in _candidate_resolve_api_paths():
+        if not candidate.exists():
+            continue
+        path_str = str(candidate)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+            logger.debug("Added Resolve API path: %s", candidate)
+        # Persist the found path so we skip the glob next time
+        try:
+            from sam3_resolve.config import Config
+            cfg = Config.instance()
+            if not cfg.get("resolve_api_path"):
+                cfg.set("resolve_api_path", path_str)
+                cfg.save()
+        except Exception:  # noqa: BLE001
+            pass
+        return   # stop at first valid candidate
+
+    logger.debug(
+        "No Resolve scripting path found. "
+        "Set resolve_api_path in config.json or RESOLVE_INSTALL_DIR env var."
+    )
 
 
 _NEEDS_PROXY_EXTENSIONS = frozenset({".braw", ".r3d", ".ari", ".arx", ".mxf"})
@@ -582,7 +658,7 @@ def create_bridge(force_mock: bool = False) -> ResolveBridgeBase:
         bridge = RealResolveBridge()
         logger.info("Using RealResolveBridge")
         return bridge
-    except ResolveNotRunningError as exc:
+    except Exception as exc:  # noqa: BLE001 — catches ImportError, ResolveNotRunningError, etc.
         logger.warning(
             "RealResolveBridge unavailable (%s). Falling back to MockResolveBridge.",
             exc,
