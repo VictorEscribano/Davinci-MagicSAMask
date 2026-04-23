@@ -306,9 +306,9 @@ class CanvasWidget(QWidget):
     def _sync_runner_prompts(self, object_id: int) -> None:
         """Push current prompt state for one object into the runner."""
         if self._runner and object_id in self._objects:
-            self._runner.set_prompts(
-                object_id, self._objects[object_id].prompts
-            )
+            prompts = self._objects[object_id].prompts
+            prompts.frame_idx = self._frame_idx
+            self._runner.set_prompts(object_id, prompts)
 
     def _schedule_inference(self) -> None:
         """Restart the debounce timer (80 ms)."""

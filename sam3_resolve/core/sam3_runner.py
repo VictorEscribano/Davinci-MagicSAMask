@@ -70,6 +70,7 @@ class ObjectPrompts:
     points: list[PromptPoint] = field(default_factory=list)
     box: Optional[PromptBox] = None
     mask_prompt: Optional[np.ndarray] = None   # external mask as input prompt
+    frame_idx: int = 0                          # video frame where prompts were placed
 
     def has_prompts(self) -> bool:
         positive = any(p.label == 1 for p in self.points)
@@ -395,28 +396,45 @@ class SAM3Runner(SAM3RunnerBase):
         stop_event: Optional[threading.Event] = None,
     ) -> PropagationResult:
         """Full-video propagation with OOM recovery."""
+        # Collect all frames upfront — the iterator is consumed once here, and
+        # the buffer is reused across OOM retries without re-reading from disk.
+        frame_buffer: list[np.ndarray] = []
+        frame_indices: list[int] = []
+        for idx, frame in frames:
+            if stop_event and stop_event.is_set():
+                result = PropagationResult(total_frames=total_frames)
+                result.cancelled = True
+                return result
+            frame_buffer.append(frame)
+            frame_indices.append(idx)
+
+        if not frame_buffer:
+            return PropagationResult(total_frames=total_frames)
+
         try:
-            return self._propagate_inner(
-                frames, start_frame_idx, total_frames,
+            return self._run_inference(
+                frame_buffer, frame_indices, start_frame_idx, total_frames,
                 progress_callback, mask_callback, stop_event
             )
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 return self._handle_oom(
-                    frames, start_frame_idx, total_frames,
+                    frame_buffer, frame_indices, start_frame_idx, total_frames,
                     progress_callback, mask_callback, stop_event, exc
                 )
             raise
 
-    def _propagate_inner(
+    def _run_inference(
         self,
-        frames: Iterator[tuple[int, np.ndarray]],
+        frame_buffer: list[np.ndarray],
+        frame_indices: list[int],
         start_frame_idx: int,
         total_frames: int,
         progress_callback: Optional[ProgressCallback],
         mask_callback: Optional[MaskCallback],
         stop_event: Optional[threading.Event],
     ) -> PropagationResult:
+        import contextlib
         import os
         import tempfile
 
@@ -427,56 +445,66 @@ class SAM3Runner(SAM3RunnerBase):
         t_start = time.monotonic()
         processed = 0
 
-        frame_buffer: list[np.ndarray] = []
-        frame_indices: list[int] = []
-
-        # Collect all frames first (SAM2 needs full sequence at once)
-        for idx, frame in frames:
-            if stop_event and stop_event.is_set():
-                result.cancelled = True
-                return result
-            frame_buffer.append(frame)
-            frame_indices.append(idx)
-
-        if not frame_buffer:
-            return result
-
         device_type = torch.device(self._device_str).type
 
-        # SAM2 resizes internally to 1024×1024. Writing full 4K frames wastes
-        # VRAM and time. Downscale to at most 720px before saving.
+        # Compute scale factor from the first frame so prompt coordinates and
+        # output masks stay aligned with the original resolution.
         _MAX_SIDE = 720
+        orig_h, orig_w = frame_buffer[0].shape[:2]
+        if orig_w > _MAX_SIDE or orig_h > _MAX_SIDE:
+            scale = _MAX_SIDE / max(orig_w, orig_h)
+        else:
+            scale = 1.0
+        scaled_w = int(orig_w * scale)
+        scaled_h = int(orig_h * scale)
 
-        def _maybe_downscale(f: np.ndarray) -> np.ndarray:
-            h, w = f.shape[:2]
-            if w <= _MAX_SIDE and h <= _MAX_SIDE:
+        def _downscale(f: np.ndarray) -> np.ndarray:
+            if scale == 1.0:
                 return f
-            scale = _MAX_SIDE / max(w, h)
-            return cv2.resize(f, (int(w * scale), int(h * scale)),
-                              interpolation=cv2.INTER_AREA)
+            return cv2.resize(f, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+
+        # torch.autocast on CPU only supports bfloat16/float16, not float32
+        if device_type == "cpu":
+            autocast_ctx: contextlib.AbstractContextManager = contextlib.nullcontext()
+        else:
+            autocast_ctx = torch.autocast(
+                device_type=device_type, dtype=getattr(torch, self._dtype_str)
+            )
 
         with tempfile.TemporaryDirectory(prefix="sam3_prop_") as tmpdir:
-            # Write frames as JPEG — SAM2 init_state expects a dir of images
             for i, frame in enumerate(frame_buffer):
-                cv2.imwrite(os.path.join(tmpdir, f"{i:06d}.jpg"),
-                            _maybe_downscale(frame))
+                cv2.imwrite(os.path.join(tmpdir, f"{i:06d}.jpg"), _downscale(frame))
 
             with self._lock:
                 with torch.inference_mode():
-                    with torch.autocast(device_type=device_type, dtype=getattr(torch, self._dtype_str)):
+                    with autocast_ctx:
                         state = self._video_predictor.init_state(tmpdir)
 
-                        # Register prompts on conditioning frame (index 0 in temp sequence)
+                        # Map real frame index → temp sequence index so prompts
+                        # land on the correct frame regardless of clip in-point.
+                        idx_map = {real: ti for ti, real in enumerate(frame_indices)}
+
                         for obj_id, prompts in self._prompts.items():
                             if not prompts.has_prompts():
                                 continue
+
+                            pts = prompts.points_array()
+                            if pts is not None and scale != 1.0:
+                                pts = pts * scale
+
+                            box = prompts.box.as_numpy() if prompts.box else None
+                            if box is not None and scale != 1.0:
+                                box = box * scale
+
+                            prompt_temp_idx = idx_map.get(prompts.frame_idx, 0)
+
                             self._video_predictor.add_new_points_or_box(
                                 inference_state=state,
-                                frame_idx=0,
+                                frame_idx=prompt_temp_idx,
                                 obj_id=obj_id,
-                                points=prompts.points_array(),
+                                points=pts,
                                 labels=prompts.labels_array(),
-                                box=prompts.box.as_numpy() if prompts.box else None,
+                                box=box,
                             )
 
                         for out_frame_idx, out_obj_ids, out_logits in (
@@ -497,6 +525,12 @@ class SAM3Runner(SAM3RunnerBase):
                                     .cpu().numpy()
                                     .astype(np.uint8) * 255
                                 )
+                                # Upscale mask back to original frame resolution
+                                if scale != 1.0:
+                                    binary = cv2.resize(
+                                        binary, (orig_w, orig_h),
+                                        interpolation=cv2.INTER_NEAREST,
+                                    )
                                 frame_masks[int(obj_id)] = binary
                                 conf = float(torch.sigmoid(logit).mean().cpu())
                                 frame_conf[int(obj_id)] = conf
@@ -520,7 +554,8 @@ class SAM3Runner(SAM3RunnerBase):
 
     def _handle_oom(
         self,
-        frames: Iterator[tuple[int, np.ndarray]],
+        frame_buffer: list[np.ndarray],
+        frame_indices: list[int],
         start_frame_idx: int,
         total_frames: int,
         progress_callback: Optional[ProgressCallback],
@@ -528,24 +563,23 @@ class SAM3Runner(SAM3RunnerBase):
         stop_event: Optional[threading.Event],
         original_exc: Exception,
     ) -> PropagationResult:
-        """OOM recovery: downgrade model then retry, then offer CPU fallback."""
+        """OOM recovery: downgrade model then retry, then CPU fallback."""
         try:
             import torch  # type: ignore[import-untyped]
             torch.cuda.empty_cache()
         except ImportError:
             pass
 
-        # Step 1: Try Base model (only if checkpoint exists)
         if self._model_name != "sam3_base":
             base_path = self._models_dir / SAM3_BASE_FILENAME
             if base_path.exists():
-                logger.warning("OOM: switching to SAM3-Base and retrying …")
+                logger.warning("OOM: switching to SAM3-Base and retrying \u2026")
                 self._model_name = "sam3_base"
                 self.unload_model()
                 try:
                     self.load_model()
-                    return self._propagate_inner(
-                        frames, start_frame_idx, total_frames,
+                    return self._run_inference(
+                        frame_buffer, frame_indices, start_frame_idx, total_frames,
                         progress_callback, mask_callback, stop_event
                     )
                 except RuntimeError as exc:
@@ -554,17 +588,14 @@ class SAM3Runner(SAM3RunnerBase):
             else:
                 logger.warning(
                     "OOM with Large model and SAM3-Base not downloaded. "
-                    "Run 'python install.py' to download the Base checkpoint, "
-                    "or the downscaling should prevent this error."
+                    "Run 'python install.py' to download the Base checkpoint."
                 )
                 raise RuntimeError(
                     "VRAM insuficiente con el modelo Large. "
                     "Descarga SAM3-Base ejecutando 'python install.py'."
                 ) from original_exc
 
-        # Step 2: Reduce batch to 1 (already minimal in our impl)
-        # Step 3: CPU fallback — re-init on CPU
-        logger.warning("OOM even with Base model; falling back to CPU (slow) …")
+        logger.warning("OOM even with Base model; falling back to CPU (slow) \u2026")
         from sam3_resolve.core.gpu_utils import GPUInfo
         cpu_gpu = GPUInfo(
             backend=Backend.CPU,
@@ -578,8 +609,8 @@ class SAM3Runner(SAM3RunnerBase):
         self._dtype_str = recommended_dtype(Backend.CPU)
         self.unload_model()
         self.load_model()
-        return self._propagate_inner(
-            frames, start_frame_idx, total_frames,
+        return self._run_inference(
+            frame_buffer, frame_indices, start_frame_idx, total_frames,
             progress_callback, mask_callback, stop_event
         )
 

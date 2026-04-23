@@ -1133,6 +1133,9 @@ class MainWindow(QMainWindow):
         self.transport.play_toggled.connect(self._on_play_toggled)
         self.transport.speed_changed.connect(self._on_speed_changed)
         self.right_panel.add_object_requested.connect(self._on_add_object)
+        self.right_panel.text_detect_requested.connect(self._on_text_detect)
+        self.right_panel.text_result_accepted.connect(self._on_text_accepted)
+        self.right_panel.text_result_rejected.connect(self._on_text_rejected)
 
         # Playback timer
         self._play_timer = QTimer(self)
@@ -1186,7 +1189,6 @@ class MainWindow(QMainWindow):
     def _on_frame_changed(self, idx: int) -> None:
         self._current_frame = idx
         self.transport.set_frame(idx)
-        # If a frame reader is attached (debug / real mode), load the frame
         if self._frame_reader is not None:
             try:
                 frame = self._frame_reader(idx)
@@ -1195,6 +1197,12 @@ class MainWindow(QMainWindow):
                     self.canvas.set_frame(frame, idx, total)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Frame read error at idx %d: %s", idx, exc)
+        # Restore stored masks when scrubbing after propagation
+        result = getattr(self, '_propagation_result', None)
+        if result is not None:
+            masks = result.masks.get(idx, {})
+            if masks:
+                self.canvas.set_all_masks(masks)
 
     def attach_frame_reader(
         self, reader: "Callable[[int], Optional[np.ndarray]]"
@@ -1211,10 +1219,14 @@ class MainWindow(QMainWindow):
         self._on_frame_changed(0)
 
     def _on_clear_all(self) -> None:
+        self.canvas.clear_all_prompts()
+        self._propagation_result = None
+        self.action_bar.set_propagation_complete(False)
+        self.action_bar.set_has_prompts(False)
         self.bottom_panel.append_log("INFO", "All prompts cleared")
 
     def _on_undo(self) -> None:
-        self.bottom_panel.append_log("INFO", "Undo last prompt")
+        self.canvas.undo_last_prompt()
 
     def _on_run(self) -> None:
         if not self._clip:
@@ -1287,7 +1299,17 @@ class MainWindow(QMainWindow):
             self._propagation_media.close_video()
 
     def _on_preview(self) -> None:
-        self.bottom_panel.append_log("INFO", "Opening preview player")
+        result = getattr(self, '_propagation_result', None)
+        if result is None or not result.masks:
+            self.bottom_panel.append_log("WARN", "Sin resultado. Ejecuta primero 'Run SAM3 \u25b6'.")
+            return
+        frames = sorted(result.masks.keys())
+        self.bottom_panel.append_log("INFO", f"Previsualizando {len(frames)} frames con m\u00e1scara…")
+        self._on_frame_changed(frames[0])
+        self.transport.set_frame(frames[0])
+        if not self.transport._btn_play.isChecked():
+            self.transport._btn_play.setChecked(True)
+        self._on_play_toggled(True)
 
     def _on_accept(self) -> None:
         self.bottom_panel.append_log("INFO", "Importing masks to Resolve Fusion…")
@@ -1303,6 +1325,64 @@ class MainWindow(QMainWindow):
             self.bottom_panel.append_log("WARN", "Propagación descartada.")
             self.action_bar.set_propagation_complete(False)
             self.action_bar.set_has_prompts(False)
+
+    def _on_text_detect(self, text: str) -> None:
+        if not text.strip():
+            return
+        if self.canvas._frame is None:
+            self.bottom_panel.append_log("WARN", "No hay frame cargado.")
+            return
+        self.bottom_panel.append_log("INFO", f"Detectando: \u2018{text.strip()}\u2019\u2026")
+        from sam3_resolve.ui.workers import TextDetectionWorker
+        worker = TextDetectionWorker(
+            frame=self.canvas._frame.copy(),
+            query=text.strip(),
+            parent=self,
+        )
+        worker.detection_ready.connect(self._on_text_detection_ready)
+        worker.no_detection.connect(self._on_text_no_detection)
+        worker.error_occurred.connect(self._on_text_detection_error)
+        worker.start()
+        self._text_worker = worker
+
+    def _on_text_detection_ready(self, result: dict) -> None:
+        self._pending_text_box = result["box"]
+        score = result["score"]
+        query = getattr(self._text_worker, "_query", "objeto")
+        self.right_panel.show_detection_result(query, score)
+        self.bottom_panel.append_log(
+            "OK", f"Detectado \u2018{query}\u2019 ({score:.0%} confianza) \u2014 Acepta o rechaza el resultado."
+        )
+
+    def _on_text_no_detection(self) -> None:
+        self._pending_text_box = None
+        self.bottom_panel.append_log("WARN", "No se detect\u00f3 ning\u00fan objeto con esa descripci\u00f3n.")
+
+    def _on_text_detection_error(self, error: str) -> None:
+        self._pending_text_box = None
+        self.bottom_panel.append_log("ERROR", f"Error en detecci\u00f3n de texto: {error}")
+
+    def _on_text_accepted(self) -> None:
+        box = getattr(self, "_pending_text_box", None)
+        if box is None:
+            return
+        x1, y1, x2, y2 = box
+        from sam3_resolve.core.sam3_runner import PromptBox
+        obj = self.canvas._active_obj()
+        if obj is not None:
+            obj.prompts.box = PromptBox(x1=x1, y1=y1, x2=x2, y2=y2)
+            self.canvas._sync_runner_prompts(obj.object_id)
+            self.canvas._schedule_inference()
+            self.canvas.prompts_changed.emit(obj.object_id)
+            self.canvas.update()
+            self.bottom_panel.append_log("OK", "Bounding box aplicado como prompt.")
+        self.right_panel.hide_detection_result()
+        self._pending_text_box = None
+
+    def _on_text_rejected(self) -> None:
+        self.right_panel.hide_detection_result()
+        self._pending_text_box = None
+        self.bottom_panel.append_log("INFO", "Detecci\u00f3n de texto rechazada.")
 
     def _on_add_object(self) -> None:
         n = len(self.canvas._objects) + 1

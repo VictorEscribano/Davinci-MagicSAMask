@@ -144,3 +144,41 @@ class PropagationWorker(QThread):
 
     def _on_mask(self, frame_idx: int, masks: dict) -> None:
         self.frame_masks_ready.emit(frame_idx, masks)
+
+
+class TextDetectionWorker(QThread):
+    """
+    Runs OWL-ViT text-grounded detection in a background thread.
+
+    Signals:
+        detection_ready(object):  {'box': [x1,y1,x2,y2], 'score': float}
+        no_detection():           nothing found above threshold
+        error_occurred(str):      error message (e.g. missing transformers)
+    """
+
+    detection_ready = pyqtSignal(object)
+    no_detection = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+
+    def __init__(
+        self,
+        frame: np.ndarray,
+        query: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._frame = frame
+        self._query = query
+
+    def run(self) -> None:
+        try:
+            from sam3_resolve.core.text_detector import detect
+            result = detect(self._frame, self._query)
+            if result is None:
+                self.no_detection.emit()
+            else:
+                box, score = result
+                self.detection_ready.emit({"box": box, "score": score})
+        except Exception as exc:  # noqa: BLE001
+            logger.error("TextDetectionWorker error: %s", exc)
+            self.error_occurred.emit(str(exc))
