@@ -96,12 +96,13 @@ class _Cv2FrameReader:
 
 # ── Debug mode entry point ─────────────────────────────────────────────────
 
-def debug_main(file_path: Optional[str] = None) -> None:
+def debug_main(file_path: Optional[str] = None, use_mock: bool = False) -> None:
     """
     Launch the full SAM3 UI without DaVinci Resolve.
 
     If file_path is None, opens a QFileDialog to pick a video.
-    Uses MockSAM3Runner — no GPU or model download needed.
+    By default uses the real SAM runner (requires model downloaded).
+    Pass use_mock=True (or --mock flag) to skip GPU/model entirely.
     """
     logging.basicConfig(
         level=logging.DEBUG,
@@ -164,10 +165,28 @@ def debug_main(file_path: Optional[str] = None) -> None:
         track_index=0,
     )
 
+    # ── Build runner ──────────────────────────────────────────────────────
+    from sam3_resolve.core.gpu_utils import detect_gpu
+    from sam3_resolve.core.sam3_runner import MockSAM3Runner, create_runner
+    if use_mock:
+        runner = MockSAM3Runner()
+        gpu_label = "[DEBUG] MockSAM3Runner — no GPU needed"
+        gpu_ready = True
+    else:
+        gpu = detect_gpu()
+        runner = create_runner(gpu_info=gpu)
+        if gpu.backend.value == "cuda":
+            gpu_label = f"[DEBUG] {gpu.device_name} · CUDA · {gpu.vram_gb:.0f}GB"
+        elif gpu.backend.value == "mps":
+            gpu_label = "[DEBUG] Apple Silicon · MPS"
+        else:
+            gpu_label = "[DEBUG] CPU mode"
+        gpu_ready = gpu.backend.value != "cpu"
+
     # ── Launch window ─────────────────────────────────────────────────────
     from sam3_resolve.ui.main_window import MainWindow
-    window = MainWindow(clip=clip)
-    window.set_gpu_info_label("[DEBUG] MockSAM3Runner — no GPU needed", ready=True)
+    window = MainWindow(clip=clip, runner=runner)
+    window.set_gpu_info_label(gpu_label, ready=gpu_ready)
     window.attach_frame_reader(reader)
     window.show()
 
@@ -198,6 +217,7 @@ def main() -> None:
 
     from sam3_resolve.core.resolve_bridge import create_bridge
     from sam3_resolve.core.gpu_utils import detect_gpu
+    from sam3_resolve.core.sam3_runner import create_runner
     from sam3_resolve.ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -205,13 +225,26 @@ def main() -> None:
     bridge = create_bridge()
     gpu = detect_gpu()
 
-    clip = None
-    try:
-        clip = bridge.get_current_clip()
-    except Exception as exc:  # noqa: BLE001
-        logger.info("No clip available at startup: %s", exc)
+    def _load_clip_from_resolve():
+        """Fetch the current Resolve clip and return (ClipInfo, frame_reader)."""
+        clip = bridge.get_current_clip()  # raises if nothing selected
+        if not Path(clip.file_path).exists():
+            raise FileNotFoundError(
+                f"Archivo no encontrado: {clip.file_path}\n"
+                "Verifica que el clip no esté offline en Resolve."
+            )
+        reader = _Cv2FrameReader(clip.file_path)
+        return clip, reader
 
-    window = MainWindow(clip=clip)
+    clip = None
+    initial_reader = None
+    try:
+        clip, initial_reader = _load_clip_from_resolve()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("No se pudo cargar el clip al iniciar: %s", exc)
+
+    runner = create_runner(gpu_info=gpu)
+    window = MainWindow(clip=clip, runner=runner)
 
     if gpu.backend.value == "cuda":
         label = f"{gpu.device_name} · CUDA · {gpu.vram_gb:.0f}GB   GPU Ready"
@@ -221,13 +254,17 @@ def main() -> None:
     else:
         window.set_gpu_info_label("CPU mode (no GPU detected)", ready=False)
 
-    # Wire real frame reading from the clip file path (if clip has a valid file)
-    if clip and Path(clip.file_path).exists():
-        try:
-            reader = _Cv2FrameReader(clip.file_path)
-            window.attach_frame_reader(reader)
-        except IOError as exc:
-            logger.warning("Could not open clip for frame reading: %s", exc)
+    # Connect the "Cargar Clip" button so the user can retry at any time
+    window.set_clip_loader(_load_clip_from_resolve)
+
+    if initial_reader is not None:
+        window.attach_frame_reader(initial_reader)
+    else:
+        window.bottom_panel.append_log(
+            "WARN",
+            "No hay clip seleccionado en Resolve. "
+            "Selecciona un clip en el timeline y pulsa '⟳ Cargar Clip'.",
+        )
 
     window.show()
     sys.exit(app.exec())
@@ -247,9 +284,14 @@ if __name__ == "__main__":
         metavar="PATH",
         help="Video file to open directly in debug mode (skips file picker)",
     )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Use MockSAM3Runner in debug mode (no GPU or model needed)",
+    )
     args = parser.parse_args()
 
     if args.debug or args.file:
-        debug_main(file_path=args.file)
+        debug_main(file_path=args.file, use_mock=args.mock)
     else:
         main()

@@ -122,9 +122,8 @@ class SettingsPanel(QWidget):
         self._visible = False
         self._anim: Optional[QPropertyAnimation] = None
         self._build()
-        # Start hidden off the right edge
-        self._move_to_hidden()
-        self.raise_()
+        # Hide until explicitly opened; geometry is computed on show_panel()
+        self.hide()
 
     # ── Build ──────────────────────────────────────────────────────────────
 
@@ -356,6 +355,8 @@ class SettingsPanel(QWidget):
         if self._visible:
             return
         self._visible = True
+        # Set starting position (off-screen right) now that parent has final size
+        self.setGeometry(self._hidden_rect())
         self.show()
         self.raise_()
         self._animate_to(self._shown_rect())
@@ -394,6 +395,16 @@ class SettingsPanel(QWidget):
 
     def _move_to_hidden(self) -> None:
         self.setGeometry(self._hidden_rect())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+
+    def parentResized(self) -> None:
+        """Call this when the parent widget is resized to keep the panel anchored."""
+        if self._visible:
+            self.setGeometry(self._shown_rect())
+        else:
+            self.hide()
 
     # ── Accessors (for tests) ──────────────────────────────────────────────
 

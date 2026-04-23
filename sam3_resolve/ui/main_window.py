@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QColor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -48,7 +48,7 @@ from sam3_resolve.constants import (
     PLUGIN_VERSION,
 )
 from sam3_resolve.core.resolve_bridge import ClipInfo, MockResolveBridge
-from sam3_resolve.core.sam3_runner import MockSAM3Runner
+from sam3_resolve.core.sam3_runner import MockSAM3Runner, SAM3RunnerBase
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,10 @@ class HeaderBar(QWidget):
         self.gpu_status = QLabel("Detecting GPU…")
         self.gpu_status.setObjectName("gpu_status_label")
 
+        self.load_clip_btn = QPushButton("⟳ Cargar Clip")
+        self.load_clip_btn.setObjectName("toolbar_btn")
+        self.load_clip_btn.setToolTip("Cargar el clip seleccionado en el timeline de Resolve")
+
         gear_btn = QPushButton("⚙")
         gear_btn.setObjectName("toolbar_btn")
         gear_btn.setToolTip("Settings")
@@ -147,6 +151,7 @@ class HeaderBar(QWidget):
         right.addWidget(self.gpu_dot)
         right.addWidget(self.gpu_status)
         right.addSpacing(8)
+        right.addWidget(self.load_clip_btn)
         right.addWidget(gear_btn)
         layout.addLayout(right)
 
@@ -962,6 +967,25 @@ class BottomPanel(QWidget):
         self._stat_widgets["frames"].setText(str(n))
 
 
+# ── Model loader worker ─────────────────────────────────────────────────────
+
+class _ModelLoaderWorker(QThread):
+    """Loads the SAM model in a background thread to keep the UI responsive."""
+    finished = pyqtSignal()
+    failed   = pyqtSignal(str)
+
+    def __init__(self, runner, parent=None):
+        super().__init__(parent)
+        self._runner = runner
+
+    def run(self):
+        try:
+            self._runner.load_model()
+            self.finished.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 # ── Main window ─────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -975,6 +999,7 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         clip: Optional[ClipInfo] = None,
+        runner: Optional[SAM3RunnerBase] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -987,13 +1012,16 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(_load_stylesheet())
 
         self._clip = clip
+        self._runner_override = runner
         self._current_frame = 0
         self._frame_reader = None   # set via attach_frame_reader()
         self._playback_fps = 25.0
         self._playback_speed = 1.0
         self._play_timer: Optional[QTimer] = None
+        self._model_loader: Optional[_ModelLoaderWorker] = None
         self._build_ui()
         self._wire_signals()
+        self._load_model_async()
 
         if clip:
             self._apply_clip(clip)
@@ -1030,8 +1058,12 @@ class MainWindow(QMainWindow):
         # Interactive canvas (replaces placeholder)
         from sam3_resolve.ui.canvas_widget import CanvasWidget
         from sam3_resolve.core.sam3_runner import create_runner
-        self._runner = create_runner(force_mock=True)
-        self._runner.load_model()
+        if self._runner_override is not None:
+            self._runner = self._runner_override
+        else:
+            self._runner = create_runner(force_mock=False)
+        # load_model() is called in a background thread via _load_model_async()
+        # to avoid blocking the UI on startup.
         self.canvas = CanvasWidget(runner=self._runner)
         self.canvas.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
@@ -1067,6 +1099,26 @@ class MainWindow(QMainWindow):
         from sam3_resolve.ui.settings_panel import SettingsPanel
         self.settings_panel = SettingsPanel(parent=central)
 
+    def set_clip_loader(self, loader: "Callable[[], tuple[ClipInfo, Callable]]") -> None:
+        """
+        Attach a callable that returns (ClipInfo, frame_reader) from Resolve.
+        Called when the user clicks the "Cargar Clip" button.
+        """
+        self._clip_loader = loader
+        self.header.load_clip_btn.clicked.connect(self._on_load_clip)
+
+    def _on_load_clip(self) -> None:
+        if not hasattr(self, "_clip_loader") or self._clip_loader is None:
+            return
+        try:
+            clip, reader = self._clip_loader()
+            self._apply_clip(clip)
+            self.attach_frame_reader(reader)
+            self.bottom_panel.append_log("OK", f"Clip cargado desde Resolve: {clip.name}")
+        except Exception as exc:  # noqa: BLE001
+            self.bottom_panel.append_log("ERROR", f"No se pudo cargar el clip: {exc}")
+            logger.warning("Clip load failed: %s", exc)
+
     def _wire_signals(self) -> None:
         self.header.settings_requested.connect(self._toggle_settings)
         self.left_panel.prompt_mode_changed.connect(self._on_prompt_mode_changed)
@@ -1089,6 +1141,26 @@ class MainWindow(QMainWindow):
         self.canvas.prompts_changed.connect(self._on_prompts_changed)
         self.canvas.inference_requested.connect(self._on_inference_requested)
         self.toolbar.undo_requested.connect(self.canvas.undo_last_prompt)
+
+    # ── Model loading ───────────────────────────────────────────────────────
+
+    def _load_model_async(self) -> None:
+        """Load the SAM model in a background thread."""
+        if self._runner.is_loaded():
+            return  # mock runner marks itself loaded immediately
+        self.bottom_panel.append_log("INFO", "Cargando modelo SAM…")
+        self.action_bar._buttons["btn_run"].setEnabled(False)
+        self._model_loader = _ModelLoaderWorker(self._runner, parent=self)
+        self._model_loader.finished.connect(self._on_model_loaded)
+        self._model_loader.failed.connect(self._on_model_failed)
+        self._model_loader.start()
+
+    def _on_model_loaded(self) -> None:
+        self.bottom_panel.append_log("OK", "Modelo SAM cargado y listo.")
+
+    def _on_model_failed(self, error: str) -> None:
+        self.bottom_panel.append_log("ERROR", f"Error al cargar el modelo: {error}")
+        logger.error("Model load failed: %s", error)
 
     # ── Clip ───────────────────────────────────────────────────────────────
 
@@ -1145,8 +1217,74 @@ class MainWindow(QMainWindow):
         self.bottom_panel.append_log("INFO", "Undo last prompt")
 
     def _on_run(self) -> None:
-        self.bottom_panel.append_log("INFO", "Starting SAM3 propagation…")
+        if not self._clip:
+            self.bottom_panel.append_log("WARN", "No hay clip cargado.")
+            return
+        if not self._runner.is_loaded():
+            self.bottom_panel.append_log("WARN", "El modelo SAM aún está cargando…")
+            return
+
+        from sam3_resolve.core.media_handler import MediaHandler
+        from sam3_resolve.ui.workers import PropagationWorker
+
+        self.bottom_panel.append_log("INFO", "Iniciando propagación SAM3…")
         self.action_bar.set_propagation_complete(False)
+        self.action_bar._buttons["btn_run"].setEnabled(False)
+
+        media = MediaHandler(self._clip)
+        try:
+            media.open_video()
+        except RuntimeError as exc:
+            self.bottom_panel.append_log("ERROR", str(exc))
+            self.action_bar._buttons["btn_run"].setEnabled(True)
+            return
+
+        worker = PropagationWorker(runner=self._runner, media_handler=media, parent=self)
+        worker.progress_updated.connect(self.bottom_panel.update_progress)
+        worker.frame_masks_ready.connect(self._on_propagation_frame)
+        worker.finished.connect(self._on_propagation_finished)
+        worker.error_occurred.connect(self._on_propagation_error)
+        worker.cancelled.connect(self._on_propagation_cancelled)
+
+        self._propagation_worker = worker   # keep reference
+        self._propagation_media  = media
+        worker.start()
+
+    def _on_propagation_frame(self, frame_idx: int, masks: dict) -> None:
+        # Update transport scrubber position
+        self.transport.set_frame(frame_idx)
+        self._current_frame = frame_idx
+        # Show the actual video frame so the mask is seen in context
+        if self._frame_reader is not None:
+            try:
+                frame = self._frame_reader(frame_idx)
+                if frame is not None:
+                    total = self._clip.duration_frames if self._clip else 1
+                    self.canvas.set_frame(frame, frame_idx, total)
+            except Exception:  # noqa: BLE001
+                pass
+        self.canvas.set_all_masks(masks)
+
+    def _on_propagation_finished(self, result) -> None:
+        self._propagation_result = result
+        n = len(result.masks)
+        self.bottom_panel.append_log("OK", f"Propagación completada — {n} frames procesados.")
+        self.action_bar.set_propagation_complete(True)
+        self.action_bar._buttons["btn_run"].setEnabled(True)
+        if hasattr(self, "_propagation_media"):
+            self._propagation_media.close_video()
+
+    def _on_propagation_error(self, error: str) -> None:
+        self.bottom_panel.append_log("ERROR", f"Error en propagación: {error}")
+        self.action_bar._buttons["btn_run"].setEnabled(True)
+        if hasattr(self, "_propagation_media"):
+            self._propagation_media.close_video()
+
+    def _on_propagation_cancelled(self) -> None:
+        self.bottom_panel.append_log("WARN", "Propagación cancelada.")
+        self.action_bar._buttons["btn_run"].setEnabled(True)
+        if hasattr(self, "_propagation_media"):
+            self._propagation_media.close_video()
 
     def _on_preview(self) -> None:
         self.bottom_panel.append_log("INFO", "Opening preview player")
@@ -1159,9 +1297,12 @@ class MainWindow(QMainWindow):
         self.action_bar.set_propagation_complete(False)
 
     def _on_cancel(self) -> None:
-        self.bottom_panel.append_log("WARN", "Propagation discarded")
-        self.action_bar.set_propagation_complete(False)
-        self.action_bar.set_has_prompts(False)
+        if hasattr(self, "_propagation_worker") and self._propagation_worker.isRunning():
+            self._propagation_worker.cancel()
+        else:
+            self.bottom_panel.append_log("WARN", "Propagación descartada.")
+            self.action_bar.set_propagation_complete(False)
+            self.action_bar.set_has_prompts(False)
 
     def _on_add_object(self) -> None:
         n = len(self.canvas._objects) + 1
@@ -1225,6 +1366,10 @@ class MainWindow(QMainWindow):
             self.settings_panel.hide_panel()
         else:
             self.settings_panel.show_panel()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.settings_panel.parentResized()
 
     # ── GPU status (called after gpu_utils.detect_gpu) ────────────────────
 

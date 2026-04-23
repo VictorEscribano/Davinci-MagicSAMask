@@ -93,16 +93,16 @@ SAM3_BASE_URL = (
 SAM3_LARGE_SHA256 = ""   # populated at first successful download; validated on re-use
 SAM3_BASE_SHA256 = ""
 
-SAM3_LARGE_SIZE_BYTES = 2_571_000_000   # ~2.4 GB
+SAM3_LARGE_SIZE_BYTES = 898_100_000     # ~898 MB (sam2.1_hiera_large.pt)
 SAM3_BASE_SIZE_BYTES = 378_000_000      # ~360 MB
 
-VRAM_THRESHOLD_LARGE_GB = 8.0           # switch to Base below this
+VRAM_THRESHOLD_LARGE_GB = 7.0           # switch to Base below this (8 GB cards report ~7.7 GB free)
 
 # ── Pip dependencies ───────────────────────────────────────────────────────
 
 BASE_DEPS = [
     "opencv-python-headless",
-    "numpy",
+    "numpy<2",
     "Pillow",
     "ffmpeg-python",
     "PyQt6",

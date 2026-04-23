@@ -227,16 +227,24 @@ class SAM3Runner(SAM3RunnerBase):
                 f"SAM3 / sam2 not installed: {exc}. Run 'python install.py' to repair."
             ) from exc
 
+        _CONFIG_MAP = {
+            "sam3_large": "configs/sam2.1/sam2.1_hiera_l.yaml",
+            "sam3_base":  "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        }
+        config_file = _CONFIG_MAP.get(self._model_name, _CONFIG_MAP["sam3_large"])
+
         dtype = getattr(torch, self._dtype_str)
         device = torch.device(self._device_str)
 
-        with torch.inference_mode():
-            with torch.autocast(device_type=device.type, dtype=dtype):
-                self._video_predictor = build_sam2_video_predictor(
-                    config_file="sam2.1_hiera_l.yaml",
-                    ckpt_path=str(checkpoint),
-                    device=device,
-                )
+        self._video_predictor = build_sam2_video_predictor(
+            config_file=config_file,
+            ckpt_path=str(checkpoint),
+            device=device,
+        )
+
+        # Image predictor shares the same loaded weights — no double load
+        from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore[import-untyped]
+        self._predictor = SAM2ImagePredictor(self._video_predictor)
 
         logger.info("Model loaded successfully")
 
@@ -289,6 +297,16 @@ class SAM3Runner(SAM3RunnerBase):
 
         path = self._models_dir / filename
         if not path.exists():
+            # Try the other model as fallback
+            fallback_name = SAM3_LARGE_FILENAME if filename == SAM3_BASE_FILENAME else SAM3_BASE_FILENAME
+            fallback_path = self._models_dir / fallback_name
+            if fallback_path.exists():
+                logger.warning(
+                    "Checkpoint %s not found; falling back to %s",
+                    filename, fallback_name,
+                )
+                self._model_name = "sam3_large" if fallback_name == SAM3_LARGE_FILENAME else "sam3_base"
+                return fallback_path
             raise FileNotFoundError(
                 f"Model checkpoint not found: {path}. Run 'python install.py'."
             )
@@ -324,8 +342,8 @@ class SAM3Runner(SAM3RunnerBase):
         """
         Run SAM3 on a single frame with the current prompt state.
 
-        Initialises a fresh video state for the one conditioning frame,
-        adds all object prompts, and reads back the predicted masks.
+        Uses SAM2ImagePredictor for fast single-frame inference without
+        writing frames to disk.
 
         Returns:
             {object_id: binary mask uint8 (H, W)} for all prompted objects.
@@ -333,38 +351,35 @@ class SAM3Runner(SAM3RunnerBase):
         if not self.is_loaded():
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
+        import cv2  # type: ignore[import-untyped]
         import torch  # type: ignore[import-untyped]
 
-        h, w = frame.shape[:2]
+        # SAM2 expects RGB
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results: dict[int, np.ndarray] = {}
+        device_type = torch.device(self._device_str).type
 
         with self._lock:
             with torch.inference_mode():
-                state = self._video_predictor.init_state_from_array(
-                    frames=[frame], device=self._device_str
-                )
+                with torch.autocast(device_type=device_type, dtype=getattr(torch, self._dtype_str)):
+                    self._predictor.set_image(rgb)
 
-                for obj_id, prompts in self._prompts.items():
-                    if not prompts.has_prompts():
-                        continue
+                    for obj_id, prompts in self._prompts.items():
+                        if not prompts.has_prompts():
+                            continue
 
-                    pts = prompts.points_array()
-                    lbs = prompts.labels_array()
-                    box = prompts.box.as_numpy() if prompts.box else None
+                        pts = prompts.points_array()
+                        lbs = prompts.labels_array()
+                        box = prompts.box.as_numpy() if prompts.box else None
 
-                    _, obj_ids, logits = self._video_predictor.add_new_points_or_box(
-                        inference_state=state,
-                        frame_idx=0,
-                        obj_id=obj_id,
-                        points=pts,
-                        labels=lbs,
-                        box=box,
-                    )
-
-                    mask_idx = list(obj_ids).index(obj_id)
-                    logit = logits[mask_idx, 0]
-                    binary = (logit > SAM3_LOGIT_THRESHOLD).cpu().numpy().astype(np.uint8) * 255
-                    results[obj_id] = binary
+                        masks, _scores, _logits = self._predictor.predict(
+                            point_coords=pts,
+                            point_labels=lbs,
+                            box=box,
+                            multimask_output=False,
+                        )
+                        # masks: (1, H, W) bool → uint8 0/255
+                        results[obj_id] = (masks[0].astype(np.uint8)) * 255
 
         return results
 
@@ -402,6 +417,10 @@ class SAM3Runner(SAM3RunnerBase):
         mask_callback: Optional[MaskCallback],
         stop_event: Optional[threading.Event],
     ) -> PropagationResult:
+        import os
+        import tempfile
+
+        import cv2  # type: ignore[import-untyped]
         import torch  # type: ignore[import-untyped]
 
         result = PropagationResult(total_frames=total_frames)
@@ -411,7 +430,7 @@ class SAM3Runner(SAM3RunnerBase):
         frame_buffer: list[np.ndarray] = []
         frame_indices: list[int] = []
 
-        # Collect all frames first (SAM2 video predictor needs full sequence)
+        # Collect all frames first (SAM2 needs full sequence at once)
         for idx, frame in frames:
             if stop_event and stop_event.is_set():
                 result.cancelled = True
@@ -422,62 +441,81 @@ class SAM3Runner(SAM3RunnerBase):
         if not frame_buffer:
             return result
 
-        with self._lock:
-            with torch.inference_mode():
-                state = self._video_predictor.init_state_from_array(
-                    frames=frame_buffer, device=self._device_str
-                )
+        device_type = torch.device(self._device_str).type
 
-                # Register prompts on conditioning frame (index 0 = start_frame_idx)
-                for obj_id, prompts in self._prompts.items():
-                    if not prompts.has_prompts():
-                        continue
-                    self._video_predictor.add_new_points_or_box(
-                        inference_state=state,
-                        frame_idx=0,
-                        obj_id=obj_id,
-                        points=prompts.points_array(),
-                        labels=prompts.labels_array(),
-                        box=prompts.box.as_numpy() if prompts.box else None,
-                    )
+        # SAM2 resizes internally to 1024×1024. Writing full 4K frames wastes
+        # VRAM and time. Downscale to at most 720px before saving.
+        _MAX_SIDE = 720
 
-                for out_frame_idx, out_obj_ids, out_logits in (
-                    self._video_predictor.propagate_in_video(state)
-                ):
-                    if stop_event and stop_event.is_set():
-                        result.cancelled = True
-                        break
+        def _maybe_downscale(f: np.ndarray) -> np.ndarray:
+            h, w = f.shape[:2]
+            if w <= _MAX_SIDE and h <= _MAX_SIDE:
+                return f
+            scale = _MAX_SIDE / max(w, h)
+            return cv2.resize(f, (int(w * scale), int(h * scale)),
+                              interpolation=cv2.INTER_AREA)
 
-                    real_idx = frame_indices[out_frame_idx]
-                    frame_masks: dict[int, np.ndarray] = {}
-                    frame_conf: dict[int, float] = {}
+        with tempfile.TemporaryDirectory(prefix="sam3_prop_") as tmpdir:
+            # Write frames as JPEG — SAM2 init_state expects a dir of images
+            for i, frame in enumerate(frame_buffer):
+                cv2.imwrite(os.path.join(tmpdir, f"{i:06d}.jpg"),
+                            _maybe_downscale(frame))
 
-                    for i, obj_id in enumerate(out_obj_ids):
-                        logit = out_logits[i, 0]
-                        binary = (
-                            (logit > SAM3_LOGIT_THRESHOLD)
-                            .cpu().numpy()
-                            .astype(np.uint8) * 255
-                        )
-                        frame_masks[int(obj_id)] = binary
-                        # Confidence: sigmoid of mean logit value
-                        conf = float(torch.sigmoid(logit).mean().cpu())
-                        frame_conf[int(obj_id)] = conf
+            with self._lock:
+                with torch.inference_mode():
+                    with torch.autocast(device_type=device_type, dtype=getattr(torch, self._dtype_str)):
+                        state = self._video_predictor.init_state(tmpdir)
 
-                    result.masks[real_idx] = frame_masks
-                    result.confidence[real_idx] = frame_conf
+                        # Register prompts on conditioning frame (index 0 in temp sequence)
+                        for obj_id, prompts in self._prompts.items():
+                            if not prompts.has_prompts():
+                                continue
+                            self._video_predictor.add_new_points_or_box(
+                                inference_state=state,
+                                frame_idx=0,
+                                obj_id=obj_id,
+                                points=prompts.points_array(),
+                                labels=prompts.labels_array(),
+                                box=prompts.box.as_numpy() if prompts.box else None,
+                            )
 
-                    if mask_callback:
-                        mask_callback(real_idx, frame_masks)
+                        for out_frame_idx, out_obj_ids, out_logits in (
+                            self._video_predictor.propagate_in_video(state)
+                        ):
+                            if stop_event and stop_event.is_set():
+                                result.cancelled = True
+                                break
 
-                    processed += 1
-                    elapsed = max(time.monotonic() - t_start, 0.001)
-                    fps = processed / elapsed
-                    eta = (total_frames - processed) / fps if fps > 0 else 0.0
-                    if progress_callback:
-                        progress_callback(processed, total_frames, fps, eta)
+                            real_idx = frame_indices[out_frame_idx]
+                            frame_masks: dict[int, np.ndarray] = {}
+                            frame_conf: dict[int, float] = {}
 
-        self._inference_state = state
+                            for i, obj_id in enumerate(out_obj_ids):
+                                logit = out_logits[i, 0]
+                                binary = (
+                                    (logit > SAM3_LOGIT_THRESHOLD)
+                                    .cpu().numpy()
+                                    .astype(np.uint8) * 255
+                                )
+                                frame_masks[int(obj_id)] = binary
+                                conf = float(torch.sigmoid(logit).mean().cpu())
+                                frame_conf[int(obj_id)] = conf
+
+                            result.masks[real_idx] = frame_masks
+                            result.confidence[real_idx] = frame_conf
+
+                            if mask_callback:
+                                mask_callback(real_idx, frame_masks)
+
+                            processed += 1
+                            elapsed = max(time.monotonic() - t_start, 0.001)
+                            fps = processed / elapsed
+                            eta = (total_frames - processed) / fps if fps > 0 else 0.0
+                            if progress_callback:
+                                progress_callback(processed, total_frames, fps, eta)
+
+                        self._inference_state = state
+
         return result
 
     def _handle_oom(
@@ -497,20 +535,32 @@ class SAM3Runner(SAM3RunnerBase):
         except ImportError:
             pass
 
-        # Step 1: Try Base model
+        # Step 1: Try Base model (only if checkpoint exists)
         if self._model_name != "sam3_base":
-            logger.warning("OOM: switching to SAM3-Base and retrying …")
-            self._model_name = "sam3_base"
-            self.unload_model()
-            try:
-                self.load_model()
-                return self._propagate_inner(
-                    frames, start_frame_idx, total_frames,
-                    progress_callback, mask_callback, stop_event
+            base_path = self._models_dir / SAM3_BASE_FILENAME
+            if base_path.exists():
+                logger.warning("OOM: switching to SAM3-Base and retrying …")
+                self._model_name = "sam3_base"
+                self.unload_model()
+                try:
+                    self.load_model()
+                    return self._propagate_inner(
+                        frames, start_frame_idx, total_frames,
+                        progress_callback, mask_callback, stop_event
+                    )
+                except RuntimeError as exc:
+                    if "out of memory" not in str(exc).lower():
+                        raise
+            else:
+                logger.warning(
+                    "OOM with Large model and SAM3-Base not downloaded. "
+                    "Run 'python install.py' to download the Base checkpoint, "
+                    "or the downscaling should prevent this error."
                 )
-            except RuntimeError as exc:
-                if "out of memory" not in str(exc).lower():
-                    raise
+                raise RuntimeError(
+                    "VRAM insuficiente con el modelo Large. "
+                    "Descarga SAM3-Base ejecutando 'python install.py'."
+                ) from original_exc
 
         # Step 2: Reduce batch to 1 (already minimal in our impl)
         # Step 3: CPU fallback — re-init on CPU
@@ -734,7 +784,7 @@ def mask_is_empty(mask: np.ndarray) -> bool:
 
 def create_runner(
     gpu_info: Optional[GPUInfo] = None,
-    model_name: str = "sam3_large",
+    model_name: Optional[str] = None,
     force_mock: bool = False,
 ) -> SAM3RunnerBase:
     """
@@ -755,6 +805,15 @@ def create_runner(
     """
     if force_mock:
         return MockSAM3Runner()
+
+    # Read model preference from config if not explicitly passed
+    if model_name is None:
+        try:
+            from sam3_resolve.config import Config
+            cfg_model = Config.instance().get("model_name", "large")
+            model_name = "sam3_large" if cfg_model == "large" else "sam3_base"
+        except Exception:  # noqa: BLE001
+            model_name = "sam3_large"
 
     try:
         if gpu_info is None:
